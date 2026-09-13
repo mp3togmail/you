@@ -1,256 +1,309 @@
+#!/usr/bin/env python3
 """
-Gmail Webhook Receiver & GitHub Actions Trigger
-Receives real-time email notifications and triggers fast video processing
+Email-to-GitHub Webhook Receiver
+
+Receives emails from Gmail and triggers GitHub Actions workflow.
+Deployed on Render, Heroku, Railway, or similar platform.
+
+Environment Variables:
+- GMAIL_WEBHOOK_SECRET: Secret key for validating webhook requests
+- GITHUB_TOKEN: GitHub personal access token
+- GITHUB_OWNER: Repository owner (e.g., mp3togmail)
+- GITHUB_REPO: Repository name (e.g., you)
+- PORT: Server port (default 5000)
 """
 
-from flask import Flask, request, jsonify
-import json
 import os
+import json
 import hmac
 import hashlib
-from datetime import datetime
 import logging
-import subprocess
-import base64
-from typing import Dict, Any
+from datetime import datetime
+from flask import Flask, request, jsonify
+import requests
 
 app = Flask(__name__)
-
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Security
-GMAIL_WEBHOOK_SECRET = os.getenv("GMAIL_WEBHOOK_SECRET")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-REPO_OWNER = "mp3togmail"
-REPO_NAME = "you"
+# Configuration from environment
+WEBHOOK_SECRET = os.getenv("GMAIL_WEBHOOK_SECRET", "your-secret-key-change-this")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "mp3togmail")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "you")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@example.com")
 
-class EmailProcessor:
-    """Fast email processor for webhook events"""
+# GitHub API endpoints
+GITHUB_API = "https://api.github.com"
+WORKFLOW_NAME = "Email Video Processor - Webhook Trigger"
+
+
+def validate_webhook_signature(payload_body, signature):
+    """Validate webhook signature"""
+    expected_signature = "sha256=" + hmac.new(
+        WEBHOOK_SECRET.encode(),
+        payload_body,
+        hashlib.sha256
+    ).hexdigest()
     
-    @staticmethod
-    def validate_webhook_signature(payload: str, signature: str) -> bool:
-        """Validate Gmail webhook signature"""
-        expected_sig = hmac.new(
-            GMAIL_WEBHOOK_SECRET.encode(),
-            payload.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        return hmac.compare_digest(signature, expected_sig)
+    return hmac.compare_digest(signature, expected_signature)
+
+
+def parse_email_body(body):
+    """Extract YouTube URL and options from email body"""
+    lines = body.lower().split('\n')
     
-    @staticmethod
-    def parse_email_data(email_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract critical information from email"""
-        try:
-            # Get email headers
-            headers = email_data.get("headers", {})
-            from_email = headers.get("from", "unknown")
-            subject = headers.get("subject", "")
-            
-            # Parse body
-            body = email_data.get("body", "")
-            
-            # Extract YouTube URL from email body
-            import re
-            youtube_pattern = r'(https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+|https?://youtu\.be/[\w-]+)'
-            youtube_urls = re.findall(youtube_pattern, body)
-            
-            if not youtube_urls:
-                return {"error": "No YouTube URL found in email"}
-            
-            youtube_url = youtube_urls[0]
-            
-            # Check for format requests
-            requested_format = "both"
-            if "mp3" in body.lower() and "mp4" not in body.lower():
-                requested_format = "mp3"
-            elif "mp4" in body.lower() and "mp3" not in body.lower():
-                requested_format = "mp4"
-            
-            # Check for admin kosher flag
-            kosher_flag = "x kosher" in body.lower()
-            
-            # Check if admin
-            admin_email = os.getenv("ADMIN_EMAIL", "")
-            is_admin = from_email == admin_email
-            
-            return {
-                "sender_email": from_email,
-                "subject": subject,
-                "youtube_url": youtube_url,
-                "requested_format": requested_format,
-                "kosher_flag": kosher_flag,
-                "is_admin": is_admin,
-                "timestamp": datetime.utcnow().isoformat(),
-                "body": body
-            }
-        except Exception as e:
-            logger.error(f"Error parsing email: {str(e)}")
-            return {"error": str(e)}
+    data = {
+        "youtube_url": "",
+        "requested_format": "both",
+        "kosher_flag": False,
+        "is_admin": False
+    }
     
-    @staticmethod
-    def trigger_github_workflow(email_data: Dict[str, Any]) -> bool:
-        """Trigger GitHub Actions workflow instantly"""
-        try:
-            import requests
-            
-            workflow_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/email-processor-webhook.yml/dispatches"
-            
-            headers = {
-                "Authorization": f"token {GITHUB_TOKEN}",
-                "Accept": "application/vnd.github.v3+json"
-            }
-            
-            payload = {
-                "ref": "main",
-                "inputs": {
-                    "email_data": json.dumps(email_data)
-                }
-            }
-            
-            response = requests.post(workflow_url, json=payload, headers=headers)
-            
-            if response.status_code == 204:
-                logger.info("✓ Workflow triggered successfully")
-                return True
-            else:
-                logger.error(f"Failed to trigger workflow: {response.status_code} {response.text}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error triggering workflow: {str(e)}")
-            return False
+    # Find YouTube URL (look for http/https)
+    import re
+    url_pattern = r'https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[\w-]+'
+    
+    for line in lines:
+        # Check for YouTube URL
+        match = re.search(url_pattern, line)
+        if match:
+            data["youtube_url"] = match.group(0)
+        
+        # Check for format preference
+        if "mp3" in line and "mp4" not in line:
+            data["requested_format"] = "mp3"
+        elif "mp4" in line and "mp3" not in line:
+            data["requested_format"] = "mp4"
+        
+        # Check for kosher flag (shorthand for admin approval)
+        if "x kosher" in line or "kosher approve" in line:
+            data["kosher_flag"] = True
+    
+    return data
 
 
-@app.route("/webhook/gmail", methods=["POST"])
-def gmail_webhook():
-    """
-    Receive Gmail webhook notifications
-    Triggered instantly when new email arrives
-    """
-    try:
-        # Get webhook data
-        webhook_data = request.get_json()
-        
-        # Validate signature
-        signature = request.headers.get("X-Gmail-Signature", "")
-        payload = request.get_data(as_text=True)
-        
-        if not EmailProcessor.validate_webhook_signature(payload, signature):
-            logger.warning("Invalid webhook signature")
-            return jsonify({"error": "Invalid signature"}), 401
-        
-        logger.info(f"📧 Email received at {datetime.utcnow().isoformat()}")
-        
-        # Parse email
-        email_data = EmailProcessor.parse_email_data(webhook_data)
-        
-        if "error" in email_data:
-            logger.error(f"Parse error: {email_data['error']}")
-            return jsonify(email_data), 400
-        
-        # Trigger GitHub Actions workflow
-        success = EmailProcessor.trigger_github_workflow(email_data)
-        
-        if success:
-            return jsonify({
-                "status": "success",
-                "message": "Processing started",
-                "youtube_url": email_data["youtube_url"],
-                "sender": email_data["sender_email"],
-                "format": email_data["requested_format"]
-            }), 202
-        else:
-            return jsonify({
-                "status": "error",
-                "message": "Failed to trigger workflow"
-            }), 500
-            
-    except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/webhook/admin-action", methods=["POST"])
-def admin_webhook():
-    """
-    Receive admin approval/rejection actions
-    Admin sends email with video link + recipient + approval action
-    """
-    try:
-        admin_data = request.get_json()
-        
-        # Validate it's from admin
-        signature = request.headers.get("X-Admin-Signature", "")
-        payload = request.get_data(as_text=True)
-        
-        if not EmailProcessor.validate_webhook_signature(payload, signature):
-            return jsonify({"error": "Invalid signature"}), 401
-        
-        logger.info("👨‍💼 Admin action received")
-        
-        # Parse admin action
-        youtube_url = admin_data.get("youtube_url")
-        target_email = admin_data.get("target_email")
-        action = admin_data.get("action")  # "approve" or "send"
-        
-        if not all([youtube_url, target_email, action]):
-            return jsonify({"error": "Missing required fields"}), 400
-        
-        # Create admin action data
-        admin_action_data = {
-            "sender_email": target_email,
-            "youtube_url": youtube_url,
-            "requested_format": "both",
-            "kosher_flag": True,  # Admin bypasses checks
-            "is_admin": True,
-            "admin_action": action,
-            "timestamp": datetime.utcnow().isoformat()
+def trigger_github_workflow(email_data):
+    """Trigger GitHub Actions workflow with email data"""
+    
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    
+    # Convert email data to JSON for workflow input
+    workflow_input = json.dumps(email_data)
+    
+    payload = {
+        "ref": "main",
+        "inputs": {
+            "email_data": workflow_input
         }
+    }
+    
+    url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{WORKFLOW_NAME}/dispatches"
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
         
-        # Trigger workflow
-        success = EmailProcessor.trigger_github_workflow(admin_action_data)
-        
-        if success:
-            return jsonify({
-                "status": "success",
-                "message": f"Admin action '{action}' triggered",
-                "target_email": target_email
-            }), 202
+        if response.status_code == 204:
+            logger.info(f"✓ Workflow triggered successfully")
+            return True
         else:
-            return jsonify({"status": "error"}), 500
+            logger.error(f"❌ Workflow trigger failed: {response.status_code} - {response.text}")
+            return False
             
     except Exception as e:
-        logger.error(f"Admin webhook error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"❌ Error triggering workflow: {str(e)}")
+        return False
 
 
-@app.route("/health", methods=["GET"])
-def health_check():
+@app.route("/", methods=["GET"])
+def health():
     """Health check endpoint"""
     return jsonify({
-        "status": "healthy",
-        "service": "Gmail Webhook Receiver",
+        "status": "ok",
+        "service": "Email to GitHub Webhook Receiver",
+        "version": "1.0.0",
         "timestamp": datetime.utcnow().isoformat()
     }), 200
 
 
-@app.route("/", methods=["GET"])
-def index():
-    """Service info"""
+@app.route("/health", methods=["GET"])
+def status():
+    """Status endpoint"""
     return jsonify({
-        "service": "Kosher YouTube Downloader - Gmail Webhook Receiver",
-        "version": "1.0.0",
-        "endpoints": {
-            "webhook": "/webhook/gmail",
-            "admin": "/webhook/admin-action",
-            "health": "/health"
-        }
+        "status": "running",
+        "github_configured": bool(GITHUB_TOKEN),
+        "webhook_secret_set": WEBHOOK_SECRET != "your-secret-key-change-this",
+        "timestamp": datetime.utcnow().isoformat()
     }), 200
+
+
+@app.route("/webhook/gmail", methods=["POST"])
+def receive_email():
+    """
+    Receive webhook from Gmail and trigger GitHub Actions
+    
+    Expected POST body:
+    {
+        "from": "sender@example.com",
+        "subject": "Download YouTube Video",
+        "body": "https://www.youtube.com/watch?v=...",
+        "timestamp": "2026-09-13T10:30:00Z"
+    }
+    """
+    
+    # Validate webhook signature
+    signature = request.headers.get("X-Webhook-Signature", "")
+    
+    if not validate_webhook_signature(request.get_data(), signature):
+        logger.warning("❌ Invalid webhook signature")
+        return jsonify({"error": "Invalid signature"}), 401
+    
+    try:
+        email_data = request.get_json()
+        
+        # Validate required fields
+        if not email_data.get("from") or not email_data.get("body"):
+            return jsonify({"error": "Missing required fields"}), 400
+        
+        logger.info(f"📧 Received email from {email_data.get('from')}")
+        
+        # Parse email body
+        parsed = parse_email_body(email_data.get("body", ""))
+        
+        if not parsed["youtube_url"]:
+            logger.warning("❌ No YouTube URL found in email")
+            return jsonify({"error": "No YouTube URL found"}), 400
+        
+        # Add sender info
+        parsed["sender_email"] = email_data.get("from")
+        parsed["is_admin"] = email_data.get("from") == ADMIN_EMAIL
+        
+        logger.info(f"✓ Parsed email:")
+        logger.info(f"  From: {parsed['sender_email']}")
+        logger.info(f"  URL: {parsed['youtube_url']}")
+        logger.info(f"  Format: {parsed['requested_format']}")
+        logger.info(f"  Admin: {parsed['is_admin']}")
+        
+        # Trigger workflow
+        if trigger_github_workflow(parsed):
+            return jsonify({
+                "status": "queued",
+                "message": "Video processing started",
+                "url": parsed["youtube_url"]
+            }), 202
+        else:
+            return jsonify({"error": "Failed to trigger workflow"}), 500
+            
+    except Exception as e:
+        logger.error(f"❌ Error processing webhook: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/webhook/admin-action", methods=["POST"])
+def admin_action():
+    """
+    Admin endpoints for manual approval/rejection
+    
+    Expected POST body:
+    {
+        "action": "approve" | "reject",
+        "target_email": "user@example.com",
+        "youtube_url": "https://...",
+        "reason": "optional reason"
+    }
+    """
+    
+    # Verify admin
+    signature = request.headers.get("X-Admin-Signature", "")
+    if not validate_webhook_signature(request.get_data(), signature):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    try:
+        data = request.get_json()
+        action = data.get("action", "").lower()
+        
+        if action not in ["approve", "reject"]:
+            return jsonify({"error": "Invalid action"}), 400
+        
+        admin_data = {
+            "sender_email": data.get("target_email"),
+            "youtube_url": data.get("youtube_url"),
+            "requested_format": data.get("format", "both"),
+            "kosher_flag": action == "approve",
+            "is_admin": True,
+            "admin_action": True,
+            "admin_reason": data.get("reason", "")
+        }
+        
+        logger.info(f"🔑 Admin {action}: {admin_data['youtube_url']}")
+        
+        if trigger_github_workflow(admin_data):
+            return jsonify({
+                "status": "queued",
+                "action": action,
+                "message": f"Admin {action} processed"
+            }), 202
+        else:
+            return jsonify({"error": "Failed to trigger workflow"}), 500
+            
+    except Exception as e:
+        logger.error(f"❌ Admin action error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/test", methods=["POST"])
+def test_webhook():
+    """
+    Test endpoint - doesn't require signature
+    Useful for debugging without sending actual emails
+    """
+    
+    try:
+        data = request.get_json()
+        
+        logger.info("🧪 Test webhook received")
+        logger.info(f"   Data: {json.dumps(data, indent=2)}")
+        
+        # Don't actually trigger workflow in test mode
+        return jsonify({
+            "status": "test_success",
+            "message": "Test webhook received",
+            "data_received": data
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Test error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.errorhandler(404)
+def not_found(e):
+    """404 handler"""
+    return jsonify({"error": "Endpoint not found"}), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    """500 handler"""
+    logger.error(f"❌ Server error: {str(e)}")
+    return jsonify({"error": "Internal server error"}), 500
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
+    
+    # Verify configuration
+    if not GITHUB_TOKEN:
+        logger.warning("⚠️  GITHUB_TOKEN not set - workflow triggering will fail")
+    
+    if WEBHOOK_SECRET == "your-secret-key-change-this":
+        logger.warning("⚠️  WEBHOOK_SECRET not changed - security risk!")
+    
     logger.info(f"🚀 Starting webhook receiver on port {port}")
+    logger.info(f"   GitHub: {GITHUB_OWNER}/{GITHUB_REPO}")
+    logger.info(f"   Admin Email: {ADMIN_EMAIL}")
+    
     app.run(host="0.0.0.0", port=port, debug=False)
