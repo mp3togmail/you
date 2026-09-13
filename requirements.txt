@@ -1,0 +1,41 @@
+# Core dependencies
+Flask==2.3.3
+flask-cors==4.0.0
+gunicorn==21.2.0
+
+# YouTube & Video Processing
+yt-dlp==2023.9.24
+ffmpeg-python==0.2.1
+opencv-python==4.8.0.76
+opencv-contrib-python==4.8.0.76
+
+# Audio Processing
+librosa==0.10.0
+soundfile==0.12.1
+pydub==0.25.1
+
+# AI & ML
+openai==1.3.0
+numpy==1.24.3
+scipy==1.11.2
+
+# Google Drive & Cloud
+google-auth==2.23.0
+google-auth-oauthlib==1.1.0
+google-auth-httplib2==0.1.1
+google-api-python-client==2.100.0
+google-cloud-storage==2.13.0
+
+# Email & HTTP
+python-dotenv==1.0.0
+requests==2.31.0
+aiohttp==3.9.0
+
+# Async & Concurrency
+asyncio==3.4.3
+aiofiles==23.2.1
+
+# Utilities
+Pillow==10.0.0
+python-dateutil==2.8.2
+pytz==2023.3
